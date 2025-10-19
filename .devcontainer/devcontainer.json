@@ -1,0 +1,25 @@
+{
+  "name": "PufferTron",
+  "image": "pufferai/puffertank:3.0",
+  "runArgs": ["--gpus=all", "--ipc=host"],
+  "remoteUser": "root",
+  "overrideCommand": true,
+  "workspaceFolder": "/workspaces/${localWorkspaceFolderBasename}",
+  "workspaceMount": "source=${localWorkspaceFolder},target=/workspaces/${localWorkspaceFolderBasename},type=bind",
+  "shutdownAction": "none",
+  "postCreateCommand": "/puffertank/venv/bin/python -m pip install -e .",
+  "remoteEnv": {
+    "WANDB_API_KEY": "${localEnv:WANDB_API_KEY}"
+  },
+  "mounts": [
+    "source=${env:HOME}/.config/wandb,target=/root/.config/wandb,type=bind",
+    "source=${env:HOME}/.netrc,target=/root/.netrc,type=bind,consistency=cached"
+  ],
+  "customizations": {
+    "vscode": {
+      "settings": {
+        "terminal.integrated.cwd": "/workspaces/${localWorkspaceFolderBasename}"
+      }
+    }
+  }
+}

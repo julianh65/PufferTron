@@ -5,6 +5,7 @@ Play a Tron match against a trained PufferLib policy.
 Controls:
   - Arrow keys / WASD map to global directions (up/right/down/left)
   - Turns are translated into relative Tron actions under the hood
+Use --window-scale for extra on-screen upscaling.
   - Esc       quit
 """
 
@@ -12,16 +13,18 @@ from __future__ import annotations
 
 import argparse
 import glob
+import math
 import os
 import sys
 import time
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, Optional, Tuple
 
 import numpy as np
 import torch
 
 import pufferlib.pytorch
+from pufferlib.ocean.tron import binding
 from pufferlib.ocean.tron.tron import Tron
 from pufferlib.pufferl import load_config
 
@@ -76,6 +79,17 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=8,
         help="Pixel scale factor used when converting the RGB array for display.",
+    )
+    parser.add_argument(
+        "--window-scale",
+        type=float,
+        default=2.0,
+        help="Extra screen upscaling applied via pygame (set to 1 for native size).",
+    )
+    parser.add_argument(
+        "--fog-of-war",
+        action="store_true",
+        help="If set, mask the human view to their local vision window.",
     )
     parser.add_argument(
         "--device",
@@ -209,6 +223,122 @@ def relative_action(current_heading: int, desired_heading: Optional[int]) -> int
     return ACTION_RIGHT
 
 
+def get_env_state(env: Tron, env_index: int = 0) -> Dict[str, np.ndarray]:
+    state = binding.env_get(env._c_env_handles[env_index])
+    width = int(state["width"])
+    height = int(state["height"])
+
+    def to_grid(key: str) -> np.ndarray:
+        buffer = state[key]
+        return np.frombuffer(buffer, dtype=np.uint8, count=width * height).reshape(height, width)
+
+    trail = to_grid("trail_owner")
+    head = to_grid("head_owner")
+    crash = to_grid("crash_map")
+    alive = np.frombuffer(state["alive"], dtype=np.uint8, count=env.num_agents)
+
+    return {
+        "width": width,
+        "height": height,
+        "trail": trail,
+        "head": head,
+        "crash": crash,
+        "alive": alive,
+    }
+
+
+def find_agent_position(
+    head_grid: np.ndarray,
+    trail_grid: np.ndarray,
+    agent_id_1based: int,
+    fallback: Optional[Tuple[int, int]] = None,
+) -> Optional[Tuple[int, int]]:
+    positions = np.argwhere(head_grid == agent_id_1based)
+    if positions.size:
+        y, x = positions[0]
+        return int(y), int(x)
+
+    trail_pos = np.argwhere(trail_grid == agent_id_1based)
+    if trail_pos.size:
+        y, x = trail_pos[-1]
+        return int(y), int(x)
+
+    return fallback
+
+
+def visibility_mask(
+    width: int,
+    height: int,
+    position: Tuple[int, int],
+    vision: int,
+) -> np.ndarray:
+    cy, cx = position
+    r_lo = vision // 2
+    r_hi = vision - r_lo - 1
+
+    x0 = max(0, cx - r_lo)
+    x1 = min(width - 1, cx + r_hi)
+    y0 = max(0, cy - r_lo)
+    y1 = min(height - 1, cy + r_hi)
+
+    mask = np.zeros((height, width), dtype=bool)
+    mask[y0 : y1 + 1, x0 : x1 + 1] = True
+    return mask
+
+
+def apply_fog(
+    frame: np.ndarray,
+    mask: np.ndarray,
+    background: np.ndarray,
+    fog_color: Tuple[int, int, int] = (20, 24, 32),
+) -> np.ndarray:
+    fogged = frame.copy()
+    mask_bool = mask.astype(bool, copy=False)
+    fh, fw = fogged.shape[:2]
+    mh, mw = mask_bool.shape
+    if fh != mh or fw != mw:
+        scale_y = max(1, fh // mh)
+        scale_x = max(1, fw // mw)
+        mask_bool = np.repeat(mask_bool, scale_y, axis=0)
+        mask_bool = np.repeat(mask_bool, scale_x, axis=1)
+        mask_bool = mask_bool[:fh, :fw]
+    fogged[~mask_bool] = np.asarray(fog_color, dtype=np.uint8)
+    return fogged
+
+
+def obs_dim_to_vision(obs_dim: int) -> Optional[int]:
+    adjusted = obs_dim - 5
+    if adjusted <= 0 or adjusted % 2:
+        return None
+    window_elems = adjusted // 2
+    root = int(round(math.sqrt(window_elems)))
+    if root * root != window_elems:
+        return None
+    return root
+
+
+def infer_vision_from_state_dict(state_dict: Dict[str, torch.Tensor]) -> Optional[int]:
+    candidate_keys = [
+        "policy.encoder.0.weight",
+        "encoder.0.weight",
+        "policy.encoder.weight",
+        "encoder.weight",
+    ]
+    for key in candidate_keys:
+        tensor = state_dict.get(key)
+        if tensor is not None and hasattr(tensor, "shape") and tensor.ndim == 2:
+            vision = obs_dim_to_vision(tensor.shape[1])
+            if vision is not None:
+                return vision
+
+    for tensor in state_dict.values():
+        if hasattr(tensor, "shape") and getattr(tensor, "ndim", 0) == 2:
+            vision = obs_dim_to_vision(tensor.shape[1])
+            if vision is not None:
+                return vision
+    return None
+
+
 def ensure_device(requested: str) -> torch.device:
     requested_device = requested.lower()
     if requested_device == "cuda" and not torch.cuda.is_available():
@@ -230,21 +360,6 @@ def main() -> None:
     finally:
         sys.argv = orig_argv
 
-    total_agents = args.bots + 1
-    if not 0 <= args.human_index < total_agents:
-        raise ValueError(f"--human-index must be between 0 and {total_agents - 1}")
-    if args.fps <= 0:
-        raise ValueError("--fps must be greater than 0")
-
-    env_kwargs = dict(config.get("env", {}))
-    env_kwargs["num_agents"] = total_agents
-    env_kwargs["render_scale"] = args.render_scale
-
-    env = Tron(num_envs=1, render_mode=None, **env_kwargs)
-
-    policy = build_policy(config, env, device)
-    bot_indices = [i for i in range(total_agents) if i != args.human_index]
-
     if args.checkpoint is None:
         checkpoint_path = find_latest_checkpoint(args.checkpoint_root)
         print(f"Loaded latest checkpoint: {checkpoint_path}")
@@ -256,6 +371,29 @@ def main() -> None:
 
     state_dict = torch.load(checkpoint_path, map_location=device, weights_only=False)
     state_dict = {k.replace("module.", ""): v for k, v in state_dict.items()}
+    inferred_vision = infer_vision_from_state_dict(state_dict)
+    total_agents = args.bots + 1
+    if not 0 <= args.human_index < total_agents:
+        raise ValueError(f"--human-index must be between 0 and {total_agents - 1}")
+    if args.fps <= 0:
+        raise ValueError("--fps must be greater than 0")
+    if args.window_scale <= 0:
+        raise ValueError("--window-scale must be greater than 0")
+
+    env_kwargs = dict(config.get("env", {}))
+    env_kwargs["num_agents"] = total_agents
+    env_kwargs["render_scale"] = args.render_scale
+    if inferred_vision is not None and env_kwargs.get("vision_size") != inferred_vision:
+        print(
+            f"Adjusting vision_size to {inferred_vision} to match checkpoint "
+            f"(was {env_kwargs.get('vision_size')})."
+        )
+        env_kwargs["vision_size"] = inferred_vision
+
+    env = Tron(num_envs=1, render_mode=None, **env_kwargs)
+
+    policy = build_policy(config, env, device)
+    bot_indices = [i for i in range(total_agents) if i != args.human_index]
     policy.load_state_dict(state_dict)
 
     policy_state = init_policy_state(policy, len(bot_indices), device)
@@ -265,9 +403,31 @@ def main() -> None:
 
     reset_seed = args.seed
     obs, _ = env.reset(seed=reset_seed)
+
+    state_cache: Optional[Dict[str, np.ndarray]] = None
+    human_position: Optional[Tuple[int, int]] = None
+    if args.fog_of_war:
+        state_cache = get_env_state(env)
+        human_position = find_agent_position(
+            state_cache["head"],
+            state_cache["trail"],
+            args.human_index + 1,
+        )
+
     frame = env.rgb_array(scale=args.render_scale)
+    if args.fog_of_war and human_position is not None and state_cache is not None:
+        mask = visibility_mask(
+            state_cache["width"],
+            state_cache["height"],
+            human_position,
+            env._vision,
+        )
+        frame = apply_fog(frame, mask, env._background)
+
     height, width = frame.shape[:2]
-    window = pygame.display.set_mode((width, height))
+    display_width = int(width * args.window_scale)
+    display_height = int(height * args.window_scale)
+    window = pygame.display.set_mode((display_width, display_height))
 
     vision = env._vision
     human_heading = heading_from_observation(
@@ -280,6 +440,7 @@ def main() -> None:
         "Controls: arrow keys / WASD map to global directions "
         "(Esc to quit, hold key for consecutive turns)."
     )
+    print("Tip: tweak --window-scale or --render-scale for a larger display; add --fog-of-war to restrict vision.")
     while running:
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
@@ -306,12 +467,33 @@ def main() -> None:
 
         obs, rewards, terminals, truncations, info = env.step(actions)
         episode_rewards += rewards
+
+        if args.fog_of_war:
+            state_cache = get_env_state(env)
+            human_position = find_agent_position(
+                state_cache["head"],
+                state_cache["trail"],
+                args.human_index + 1,
+                fallback=human_position,
+            )
+
         human_heading = heading_from_observation(
             obs[args.human_index], vision, human_heading
         )
 
         frame = env.rgb_array(scale=args.render_scale)
+        if args.fog_of_war and human_position is not None and state_cache is not None:
+            mask = visibility_mask(
+                state_cache["width"],
+                state_cache["height"],
+                human_position,
+                env._vision,
+            )
+            frame = apply_fog(frame, mask, env._background)
+
         surface = pygame.surfarray.make_surface(np.transpose(frame, (1, 0, 2)))
+        if args.window_scale != 1.0:
+            surface = pygame.transform.smoothscale(surface, (display_width, display_height))
         window.blit(surface, (0, 0))
         pygame.display.flip()
 
@@ -332,6 +514,14 @@ def main() -> None:
                 policy_state = init_policy_state(policy, len(bot_indices), device)
             reset_seed += 1
             obs, _ = env.reset(seed=reset_seed)
+            if args.fog_of_war:
+                state_cache = get_env_state(env)
+                human_position = find_agent_position(
+                    state_cache["head"],
+                    state_cache["trail"],
+                    args.human_index + 1,
+                    fallback=human_position,
+                )
             human_heading = heading_from_observation(
                 obs[args.human_index], vision, human_heading
             )

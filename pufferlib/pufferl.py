@@ -237,6 +237,14 @@ class PuffeRL:
             self.heuristic_eval_interval if self._heuristic_eval_enabled else float('inf')
         )
         self._heuristic_evaluator = None
+        self.heuristic_eval_video_opponent = config.get('heuristic_eval_video_opponent', None)
+        self.heuristic_eval_video_length = int(
+            config.get('heuristic_eval_video_length', self.video_length) or self.video_length or 1
+        )
+        self.heuristic_eval_video_fps = int(
+            config.get('heuristic_eval_video_fps', self.video_fps) or self.video_fps or 12
+        )
+        self.heuristic_eval_video_seed = config.get('heuristic_eval_video_seed', None)
 
         # Dashboard
         self.model_size = sum(p.numel() for p in policy.parameters() if p.requires_grad)
@@ -267,7 +275,7 @@ class PuffeRL:
             else float('inf')
         )
 
-    def _write_video_file(self, frames: np.ndarray) -> Optional[Tuple[str, str]]:
+    def _write_video_file(self, frames: np.ndarray, fps: Optional[int] = None) -> Optional[Tuple[str, str]]:
         """Encode captured frames to disk and return (path, format)."""
         if imageio is None:
             print("imageio not installed; skipping video export")
@@ -281,15 +289,17 @@ class PuffeRL:
         os.makedirs(video_dir, exist_ok=True)
 
         base_filename = f"video_{self._video_id:06d}"
+        effective_fps = fps or self.video_fps
 
         # Prefer mp4 for better WANDB playback; fall back to gif if encoding fails
         mp4_path = os.path.join(video_dir, f"{base_filename}.mp4")
         try:
             with imageio.get_writer(
                 mp4_path,
-                fps=self.video_fps,
+                fps=effective_fps,
                 format="FFMPEG",
                 codec="libx264",
+                macro_block_size=1,
             ) as writer:
                 for frame in frames:
                     writer.append_data(frame)
@@ -299,7 +309,7 @@ class PuffeRL:
 
         gif_path = os.path.join(video_dir, f"{base_filename}.gif")
         try:
-            imageio.mimsave(gif_path, frames, fps=self.video_fps, loop=0)
+            imageio.mimsave(gif_path, frames, fps=effective_fps, loop=0)
             return gif_path, "gif"
         except Exception as exc:
             print(f"Failed to write GIF to {gif_path}: {exc}")
@@ -452,6 +462,45 @@ class PuffeRL:
             prefix = f'heuristic_eval/{name}'
             for key, value in metrics.items():
                 logs[f'{prefix}/{key}'] = value
+
+        if self.heuristic_eval_video_opponent:
+            try:
+                frames = self._heuristic_evaluator.generate_video(
+                    self.policy,
+                    self.heuristic_eval_video_opponent,
+                    max_frames=max(1, self.heuristic_eval_video_length),
+                    seed=self.heuristic_eval_video_seed,
+                )
+            except Exception as exc:
+                print(f"Heuristic video generation failed ({self.heuristic_eval_video_opponent}): {exc}")
+            else:
+                if frames:
+                    try:
+                        frames_array = np.stack(frames, axis=0)
+                    except Exception as exc:
+                        print(f"Failed to stack heuristic video frames: {exc}")
+                    else:
+                        video_output = self._write_video_file(
+                            frames_array,
+                            fps=self.heuristic_eval_video_fps,
+                        )
+                        if video_output:
+                            video_path, video_format = video_output
+                            video_key = f'videos/heuristic/{self.heuristic_eval_video_opponent}'
+                            if hasattr(self.logger, 'wandb') and getattr(self.logger, 'wandb', None):
+                                try:
+                                    logs[video_key] = self.logger.wandb.Video(
+                                        video_path,
+                                        fps=self.heuristic_eval_video_fps,
+                                        format=video_format,
+                                    )
+                                except Exception as exc:
+                                    print(f"Failed to log heuristic video to wandb: {exc}")
+                                    logs[video_key] = video_path
+                            else:
+                                logs[video_key] = video_path
+                            self._video_id += 1
+
         return logs
 
     def evaluate(self):

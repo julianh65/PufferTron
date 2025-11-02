@@ -16,11 +16,18 @@ import shutil
 import argparse
 import importlib
 import configparser
+import copy
+from typing import Optional, Tuple
 from threading import Thread
 from collections import defaultdict, deque
 
 import numpy as np
 import psutil
+
+try:
+    import imageio
+except ImportError:
+    imageio = None
 
 import torch
 import torch.distributed
@@ -207,6 +214,30 @@ class PuffeRL:
         self.last_stats = defaultdict(list)
         self.losses = {}
 
+        # Optional video capture configuration
+        self.video_interval = int(config.get('video_interval', 0) or 0)
+        self.video_length = int(config.get('video_length', 64) or 0)
+        self.video_fps = int(config.get('video_fps', 12) or 12)
+        self.video_capture_env = int(config.get('video_env_index', 0) or 0)
+        self.video_seed = config.get('video_seed', None)
+        self._video_seed_counter = 0
+        self._video_next_step = self.video_interval if self.video_interval > 0 else float('inf')
+        self._video_pending = None
+        self._video_id = 0
+
+        # Scripted evaluation (Tron-specific diagnostics)
+        self.heuristic_eval_interval = int(config.get('heuristic_eval_interval', 0) or 0)
+        self.heuristic_eval_episodes = int(config.get('heuristic_eval_episodes', 0) or 0)
+        self.heuristic_eval_num_agents = int(config.get('heuristic_eval_num_agents', 0) or 0)
+        self.heuristic_eval_num_envs = int(config.get('heuristic_eval_num_envs', 1) or 1)
+        self._heuristic_eval_enabled = (
+            config.get('env') == 'puffer_tron' and self.heuristic_eval_interval > 0
+        )
+        self._heuristic_eval_next_step = (
+            self.heuristic_eval_interval if self._heuristic_eval_enabled else float('inf')
+        )
+        self._heuristic_evaluator = None
+
         # Dashboard
         self.model_size = sum(p.numel() for p in policy.parameters() if p.requires_grad)
         self.print_dashboard(clear=True)
@@ -222,6 +253,207 @@ class PuffeRL:
 
         return (self.global_step - self.last_log_step) / (time.time() - self.last_log_time)
 
+    def _ensure_video_capture(self):
+        if self.video_interval <= 0:
+            return
+        if self._video_pending is not None:
+            return
+        if self.global_step < self._video_next_step:
+            return
+        self._video_pending = self.global_step
+        self._video_next_step = (
+            self.global_step + self.video_interval
+            if self.video_interval > 0
+            else float('inf')
+        )
+
+    def _write_video_file(self, frames: np.ndarray) -> Optional[Tuple[str, str]]:
+        """Encode captured frames to disk and return (path, format)."""
+        if imageio is None:
+            print("imageio not installed; skipping video export")
+            return None
+        if frames.size == 0:
+            return None
+
+        run_id = getattr(self.logger, "run_id", "offline")
+        base_dir = os.path.join(self.config["data_dir"], f'{self.config["env"]}_{run_id}')
+        video_dir = os.path.join(base_dir, "videos")
+        os.makedirs(video_dir, exist_ok=True)
+
+        base_filename = f"video_{self._video_id:06d}"
+
+        # Prefer mp4 for better WANDB playback; fall back to gif if encoding fails
+        mp4_path = os.path.join(video_dir, f"{base_filename}.mp4")
+        try:
+            with imageio.get_writer(
+                mp4_path,
+                fps=self.video_fps,
+                format="FFMPEG",
+                codec="libx264",
+            ) as writer:
+                for frame in frames:
+                    writer.append_data(frame)
+            return mp4_path, "mp4"
+        except Exception as exc:
+            print(f"Failed to encode MP4 ({mp4_path}): {exc}. Falling back to GIF.")
+
+        gif_path = os.path.join(video_dir, f"{base_filename}.gif")
+        try:
+            imageio.mimsave(gif_path, frames, fps=self.video_fps, loop=0)
+            return gif_path, "gif"
+        except Exception as exc:
+            print(f"Failed to write GIF to {gif_path}: {exc}")
+            return None
+
+    def _generate_policy_video(self) -> Optional[Tuple[str, str]]:
+        """Run a short policy rollout in-process to produce a video."""
+        if imageio is None:
+            print("imageio not installed; skipping video export")
+            return None
+
+        env_name = self.config.get('env')
+        package = self.config.get('package', 'ocean') or 'ocean'
+        module_name = 'pufferlib.ocean' if package == 'ocean' else f'pufferlib.environments.{package}'
+
+        try:
+            env_module = importlib.import_module(module_name)
+            env_creator = env_module.env_creator
+        except Exception as exc:
+            print(f"Video generation failed to resolve env creator: {exc}")
+            return None
+
+        try:
+            env_cls = env_creator(env_name)
+        except Exception as exc:
+            print(f"Video generation failed to load environment class: {exc}")
+            return None
+
+        env_kwargs = copy.deepcopy(self.config.get('env_args', {})) or {}
+        env_kwargs['num_envs'] = 1
+        env_kwargs['render_mode'] = 'rgb_array'
+        env_kwargs.setdefault('video_env_index', self.video_capture_env)
+
+        try:
+            env = env_cls(**env_kwargs)
+        except Exception as exc:
+            print(f"Video generation failed to instantiate environment: {exc}")
+            return None
+
+        try:
+            policy_module = importlib.import_module(f'{module_name}.torch')
+            policy_cls = getattr(policy_module, self.config.get('policy_name', 'Policy'))
+            policy_args = copy.deepcopy(self.config.get('policy_args', {})) or {}
+            base_policy = policy_cls(env, **policy_args)
+            if self.config.get('rnn_name'):
+                rnn_cls = getattr(policy_module, self.config['rnn_name'])
+                rnn_args = copy.deepcopy(self.config.get('rnn_args', {})) or {}
+                policy = rnn_cls(env, base_policy, **rnn_args)
+            else:
+                policy = base_policy
+        except Exception as exc:
+            env.close()
+            print(f"Video generation failed to create policy: {exc}")
+            return None
+
+        try:
+            state_dict = {k: v.detach().cpu() for k, v in self.uncompiled_policy.state_dict().items()}
+            policy.load_state_dict(state_dict, strict=False)
+        except Exception as exc:
+            env.close()
+            print(f"Video generation failed to load policy weights: {exc}")
+            return None
+
+        device = torch.device('cpu')
+        policy = policy.to(device)
+        policy.eval()
+
+        max_frames = max(1, self.video_length)
+        frames: list[np.ndarray] = []
+
+        try:
+            if self.video_seed is None:
+                seed = random.randint(0, 2**31 - 1)
+            else:
+                seed = int(self.video_seed) + self._video_seed_counter
+                self._video_seed_counter += 1
+            obs, _ = env.reset(seed=seed)
+            obs = np.array(obs, copy=True)
+            state = None
+            if self.config.get('use_rnn'):
+                hidden_size = getattr(policy, 'hidden_size', None)
+                if hidden_size is not None:
+                    num_agents = env.num_agents
+                    state = {
+                        'lstm_h': torch.zeros(num_agents, hidden_size, device=device),
+                        'lstm_c': torch.zeros(num_agents, hidden_size, device=device),
+                    }
+
+            with torch.no_grad():
+                for step in range(max_frames):
+                    frame = env.rgb_array(env_index=min(self.video_capture_env, env.num_envs - 1))
+                    frames.append(np.array(frame, copy=True))
+
+                    obs_tensor = torch.as_tensor(obs, device=device)
+                    if state is None:
+                        logits, _ = policy.forward_eval(obs_tensor)
+                    else:
+                        logits, _ = policy.forward_eval(obs_tensor, state)
+
+                    action, _, _ = pufferlib.pytorch.sample_logits(logits)
+                    action_np = np.array(action.cpu().numpy(), copy=False)
+                    if action_np.ndim > 1:
+                        action_np = np.squeeze(action_np, axis=-1)
+                    if isinstance(logits, torch.distributions.Normal):
+                        action_np = np.clip(action_np, env.single_action_space.low, env.single_action_space.high)
+                    else:
+                        action_np = action_np.astype(np.int64, copy=False)
+                    action_np = np.ascontiguousarray(action_np)
+
+                    obs, rewards, terminals, truncations, info = env.step(action_np)
+                    obs = np.array(obs, copy=True)
+                    terminals = np.asarray(terminals)
+                    truncations = np.asarray(truncations)
+                    if np.all(terminals) or np.all(truncations):
+                        frames.append(np.array(env.rgb_array(env_index=min(self.video_capture_env, env.num_envs - 1)), copy=True))
+                        break
+        except Exception as exc:
+            print(f"Video generation rollout failed: {exc}")
+            frames = []
+        finally:
+            env.close()
+
+        if not frames:
+            return None
+
+        frames_array = np.stack(frames, axis=0)
+        return self._write_video_file(frames_array)
+
+    def _maybe_run_heuristic_eval(self):
+        if not self._heuristic_eval_enabled:
+            return {}
+        if self.global_step < self._heuristic_eval_next_step:
+            return {}
+
+        if self._heuristic_evaluator is None:
+            from pufferlib.ocean.tron.heuristics import TronHeuristicEvaluator
+
+            eval_config = copy.deepcopy(self.config)
+            eval_config['heuristic_eval_episodes'] = self.heuristic_eval_episodes or eval_config.get('heuristic_eval_episodes', 5)
+            num_agents = self.heuristic_eval_num_agents or eval_config['env_args'].get('num_agents', 2)
+            eval_config['heuristic_eval_num_agents'] = max(2, num_agents)
+            eval_config['heuristic_eval_num_envs'] = self.heuristic_eval_num_envs
+            self._heuristic_evaluator = TronHeuristicEvaluator(eval_config)
+
+        results = self._heuristic_evaluator.run(self.policy)
+        self._heuristic_eval_next_step = self.global_step + self.heuristic_eval_interval
+
+        logs = {}
+        for name, metrics in results.items():
+            prefix = f'heuristic_eval/{name}'
+            for key, value in metrics.items():
+                logs[f'{prefix}/{key}'] = value
+        return logs
+
     def evaluate(self):
         profile = self.profile
         epoch = self.epoch
@@ -236,6 +468,7 @@ class PuffeRL:
                 self.lstm_h[k].zero_()
                 self.lstm_c[k].zero_()
 
+        self._ensure_video_capture()
         self.full_rows = 0
         while self.full_rows < self.segments:
             profile('env', epoch)
@@ -497,6 +730,32 @@ class PuffeRL:
             #**{f'losses/{k}': dist_mean(v, device) for k, v in self.losses.items()},
             #**{f'performance/{k}': dist_sum(v['elapsed'], device) for k, v in self.profile},
         }
+
+        should_log = True
+        if torch.distributed.is_initialized():
+            if torch.distributed.get_rank() != 0:
+                should_log = True
+            else:
+                should_log = False
+
+        if should_log:
+            heuristic_logs = self._maybe_run_heuristic_eval()
+            if heuristic_logs:
+                logs.update(heuristic_logs)
+
+        if should_log and self._video_pending is not None:
+            video_output = self._generate_policy_video()
+            if video_output:
+                video_path, video_format = video_output
+                if hasattr(self.logger, 'wandb') and getattr(self.logger, 'wandb', None):
+                    try:
+                        logs['videos/render'] = self.logger.wandb.Video(video_path, fps=self.video_fps, format=video_format)
+                    except Exception as exc:
+                        print(f"Failed to log video to wandb: {exc}")
+                else:
+                    logs['videos/render'] = video_path
+            self._video_id += 1
+            self._video_pending = None
 
         if torch.distributed.is_initialized():
            if torch.distributed.get_rank() != 0:
@@ -921,7 +1180,17 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None):
     elif args['wandb']:
         logger = WandbLogger(args)
 
-    train_config = { **args['train'], 'env': env_name }
+    train_config = copy.deepcopy(args['train'])
+    train_config.update({
+        'env': env_name,
+        'package': args['package'],
+        'env_args': copy.deepcopy(args['env']),
+        'vec_args': copy.deepcopy(args['vec']),
+        'policy_name': args['policy_name'],
+        'policy_args': copy.deepcopy(args['policy']),
+        'rnn_name': args['rnn_name'],
+        'rnn_args': copy.deepcopy(args['rnn']),
+    })
     pufferl = PuffeRL(train_config, vecenv, policy, logger)
 
     all_logs = []

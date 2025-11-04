@@ -1,10 +1,13 @@
 import collections
 import copy
+import json
 import os
 import select
 import subprocess
 import time
+import uuid
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
@@ -469,6 +472,7 @@ class TronHeuristicEvaluator:
 
     def __init__(self, config: Dict):
         env_args = copy.deepcopy(config.get("env_args", {}))
+        self.config = config
         self.device = config["device"]
         self.episodes = int(config.get("heuristic_eval_episodes", 5) or 5)
         self.num_agents = int(config.get("heuristic_eval_num_agents", 2) or 2)
@@ -492,6 +496,18 @@ class TronHeuristicEvaluator:
             self.env_args["map_height"] = int(map_height_override)
         if max_round_steps_override is not None:
             self.env_args["max_round_steps"] = int(max_round_steps_override)
+
+        self._record_opponents = self._parse_record_opponents(config)
+        self._record_contexts = self._parse_record_contexts(config)
+        self._record_enabled = bool(self._record_opponents)
+        self._record_dir = self._resolve_record_dir(config)
+        self._run_id = str(config.get("run_id", "offline"))
+        self._env_name = str(config.get("env", "env"))
+        self._policy_name = config.get("policy_name")
+        self._trainer_step = int(config.get("trainer_step", 0))
+        self._env_args_snapshot = copy.deepcopy(self.env_args)
+        if self._record_enabled:
+            os.makedirs(self._record_dir, exist_ok=True)
 
         vision = env_args.get("vision_size", 9)
         self.heuristics: Dict[str, TronHeuristic] = {}
@@ -534,6 +550,139 @@ class TronHeuristicEvaluator:
                 self.num_agents = 2
                 self.env_args["num_agents"] = 2
 
+    def _parse_record_opponents(self, config: Dict) -> set:
+        opponents_cfg = config.get("heuristic_record_opponents")
+        if opponents_cfg in (None, "", []):
+            default_flag = config.get("heuristic_record_classic_games")
+            if default_flag is None:
+                default_flag = True
+            if _as_bool(default_flag):
+                return {"classic"}
+            return set()
+
+        if isinstance(opponents_cfg, str):
+            tokens = [token.strip() for token in opponents_cfg.split(",")]
+        else:
+            tokens = [str(item).strip() for item in opponents_cfg]
+
+        opponents = set()
+        for token in tokens:
+            if not token:
+                continue
+            lowered = token.lower()
+            if lowered in {"*", "all"}:
+                return {"*"}
+            opponents.add(token)
+        return opponents
+
+    def _parse_record_contexts(self, config: Dict) -> set:
+        contexts_cfg = config.get("heuristic_record_contexts")
+        if contexts_cfg in (None, "", []):
+            return {"evaluation", "video"}
+
+        if isinstance(contexts_cfg, str):
+            tokens = [token.strip() for token in contexts_cfg.split(",")]
+        else:
+            tokens = [str(item).strip() for item in contexts_cfg]
+
+        contexts = set()
+        for token in tokens:
+            if not token:
+                continue
+            lowered = token.lower()
+            if lowered in {"*", "all"}:
+                return {"*"}
+            contexts.add(lowered)
+        return contexts or {"evaluation", "video"}
+
+    def _resolve_record_dir(self, config: Dict) -> str:
+        base_data_dir = str(config.get("data_dir", "experiments"))
+        env_name = str(config.get("env", "env"))
+        run_id = str(config.get("run_id", "offline"))
+        override = config.get("heuristic_record_dir")
+        if override:
+            if os.path.isabs(override):
+                return override
+            return os.path.join(base_data_dir, override)
+        return os.path.join(base_data_dir, f"{env_name}_{run_id}", "heuristic_games")
+
+    def _should_record(self, opponent_name: str, context: str) -> bool:
+        if not self._record_enabled:
+            return False
+        normalized_context = context.lower()
+        if "*" not in self._record_contexts and normalized_context not in self._record_contexts:
+            return False
+        if "*" in self._record_opponents:
+            return True
+        return opponent_name in self._record_opponents
+
+    def _create_episode_record(
+        self,
+        opponent_name: str,
+        context: str,
+        seed: int,
+        episode_index: int,
+        policy_indices: List[int],
+        opponent_indices: List[int],
+    ) -> Optional[Dict]:
+        if not self._should_record(opponent_name, context):
+            return None
+
+        return {
+            "timestamp": self._now_iso(),
+            "context": context,
+            "opponent": opponent_name,
+            "run_id": self._run_id,
+            "env": self._env_name,
+            "policy_name": self._policy_name,
+            "seed": int(seed),
+            "episode_index": int(episode_index),
+            "trainer_step": self._trainer_step,
+            "num_agents": int(self.num_agents),
+            "num_envs": int(self.num_envs),
+            "policy_agent_indices": [int(idx) for idx in policy_indices],
+            "opponent_agent_indices": [int(idx) for idx in opponent_indices],
+            "use_rnn": bool(self.use_rnn),
+            "device": str(self.device),
+            "env_args": copy.deepcopy(self._env_args_snapshot),
+            "steps": [],
+        }
+
+    def _write_episode_record(self, record: Optional[Dict]) -> None:
+        if not record:
+            return
+        filename = "_".join(
+            [
+                record.get("context", "unknown"),
+                record.get("opponent", "opponent"),
+                f"seed{record.get('seed', 0)}",
+                f"ep{int(record.get('episode_index', 0)):05d}",
+                uuid.uuid4().hex,
+            ]
+        ) + ".json"
+        path = os.path.join(self._record_dir, filename)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump(record, handle, indent=2, default=self._json_default)
+
+    @staticmethod
+    def _json_default(value):
+        if isinstance(value, (np.integer, np.int64, np.int32)):
+            return int(value)
+        if isinstance(value, (np.floating, np.float32, np.float64)):
+            return float(value)
+        if isinstance(value, np.bool_):
+            return bool(value)
+        if isinstance(value, np.ndarray):
+            return value.tolist()
+        if isinstance(value, (set, tuple)):
+            return list(value)
+        raise TypeError(f"Object of type {type(value).__name__} is not JSON serializable")
+
+    @staticmethod
+    def _now_iso() -> str:
+        return datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+
     def run(self, policy: torch.nn.Module) -> Dict[str, Dict[str, float]]:
         results = {}
 
@@ -567,6 +716,7 @@ class TronHeuristicEvaluator:
 
         env = Tron(**self.env_args)
         frames: List[np.ndarray] = []
+        episode_record = None
 
         policy_model = getattr(policy, "module", policy)
         training_state = policy_model.training
@@ -582,6 +732,8 @@ class TronHeuristicEvaluator:
             opponent.reset()
             rollout_seed = self.base_seed if seed is None else seed
             obs, _ = env.reset(seed=rollout_seed)
+            episode_returns = np.zeros(self.num_agents, dtype=np.float32)
+            last_terminals = None
 
             lstm_state = None
             if self.use_rnn and hidden_size is not None:
@@ -591,6 +743,14 @@ class TronHeuristicEvaluator:
                 )
 
             opponent.begin_episode(env, opponent_indices, policy_indices)
+            episode_record = self._create_episode_record(
+                opponent_name,
+                "video",
+                seed=rollout_seed,
+                episode_index=0,
+                policy_indices=policy_indices,
+                opponent_indices=opponent_indices,
+            )
 
             steps = 0
             while steps < max_frames:
@@ -613,7 +773,16 @@ class TronHeuristicEvaluator:
                 for idx in opponent_indices:
                     joint_actions[idx] = opponent.act_with_env(env, obs[idx], idx)
 
-                obs, _, terminals, _, _ = env.step(joint_actions)
+                if episode_record is not None:
+                    episode_record["steps"].append(
+                        {
+                            "actions": joint_actions.tolist(),
+                        }
+                    )
+
+                obs, rewards, terminals, truncations, _ = env.step(joint_actions)
+                episode_returns += rewards
+                last_terminals = terminals
                 steps += 1
 
                 if self.use_rnn and lstm_state is not None:
@@ -628,7 +797,27 @@ class TronHeuristicEvaluator:
                 if np.all(terminals):
                     frame = env.rgb_array(env_index=0)
                     frames.append(np.array(frame, copy=True))
+                    last_terminals = terminals
                     break
+            policy_return = float(episode_returns[policy_indices].mean())
+            opponent_return = float(episode_returns[opponent_indices].mean()) if opponent_indices else 0.0
+            completed = bool(last_terminals is not None and np.all(last_terminals))
+            truncated = bool(steps >= max_frames and not completed)
+            if episode_record is not None:
+                winner = "draw"
+                if policy_return > opponent_return + 1e-6:
+                    winner = "policy"
+                elif opponent_return > policy_return + 1e-6:
+                    winner = "opponent"
+                episode_record["result"] = {
+                    "policy_return": policy_return,
+                    "opponent_return": opponent_return,
+                    "episode_steps": steps,
+                    "completed": completed,
+                    "truncated": truncated,
+                    "winner": winner,
+                }
+                self._write_episode_record(episode_record)
         finally:
             try:
                 opponent.end_episode()
@@ -638,6 +827,18 @@ class TronHeuristicEvaluator:
             torch.set_grad_enabled(prev_grad)
             if training_state:
                 policy.train()
+            if episode_record is not None and "result" not in episode_record:
+                policy_return = float(episode_returns[policy_indices].mean())
+                opponent_return = float(episode_returns[opponent_indices].mean()) if opponent_indices else 0.0
+                episode_record["result"] = {
+                    "policy_return": policy_return,
+                    "opponent_return": opponent_return,
+                    "episode_steps": steps,
+                    "completed": False,
+                    "truncated": True,
+                    "winner": None,
+                }
+                self._write_episode_record(episode_record)
 
         return frames
 
@@ -652,7 +853,8 @@ class TronHeuristicEvaluator:
         try:
             for episode in range(self.episodes):
                 opponent.reset()
-                obs, _ = env.reset(seed=self.base_seed + episode)
+                episode_seed = self.base_seed + episode
+                obs, _ = env.reset(seed=episode_seed)
                 episode_returns = np.zeros(self.num_agents, dtype=np.float32)
                 episode_steps = 0
 
@@ -663,7 +865,16 @@ class TronHeuristicEvaluator:
                         lstm_c=torch.zeros(len(policy_indices), hidden_size, device=self.device),
                     )
 
+                episode_record = None
                 opponent.begin_episode(env, opponent_indices, policy_indices)
+                episode_record = self._create_episode_record(
+                    name,
+                    "evaluation",
+                    seed=episode_seed,
+                    episode_index=episode,
+                    policy_indices=policy_indices,
+                    opponent_indices=opponent_indices,
+                )
                 try:
                     while True:
                         policy_obs = torch.as_tensor(obs[policy_indices], device=self.device)
@@ -681,6 +892,13 @@ class TronHeuristicEvaluator:
 
                         for idx in opponent_indices:
                             joint_actions[idx] = opponent.act_with_env(env, obs[idx], idx)
+
+                        if episode_record is not None:
+                            episode_record["steps"].append(
+                                {
+                                    "actions": joint_actions.tolist(),
+                                }
+                            )
 
                         obs, rewards, terminals, truncations, _ = env.step(joint_actions)
                         episode_returns += rewards
@@ -708,9 +926,34 @@ class TronHeuristicEvaluator:
                                 result.losses += 1
                             else:
                                 result.draws += 1
+                            if episode_record is not None:
+                                winner = "draw"
+                                if policy_return > opponent_return + 1e-6:
+                                    winner = "policy"
+                                elif opponent_return > policy_return + 1e-6:
+                                    winner = "opponent"
+                                episode_record["result"] = {
+                                    "policy_return": policy_return,
+                                    "opponent_return": opponent_return,
+                                    "episode_steps": episode_steps,
+                                    "completed": True,
+                                    "winner": winner,
+                                }
+                                self._write_episode_record(episode_record)
                             break
                 finally:
                     opponent.end_episode()
+                    if episode_record is not None and "result" not in episode_record:
+                        policy_partial_return = float(episode_returns[policy_indices].mean())
+                        opponent_partial_return = float(episode_returns[opponent_indices].mean()) if opponent_indices else 0.0
+                        episode_record["result"] = {
+                            "policy_return": policy_partial_return,
+                            "opponent_return": opponent_partial_return,
+                            "episode_steps": episode_steps,
+                            "completed": False,
+                            "winner": None,
+                        }
+                        self._write_episode_record(episode_record)
         finally:
             env.close()
 

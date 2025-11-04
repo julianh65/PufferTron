@@ -259,6 +259,9 @@ class ProcgenResnet(nn.Module):
         super().__init__()
         h, w, c = env.single_observation_space.shape
         shape = (c, h, w)
+        self.is_continuous = False
+        self.hidden_size = mlp_width
+        self.output_size = mlp_width
         conv_seqs = []
         for out_channels in [cnn_width, 2*cnn_width, 2*cnn_width]:
             conv_seq = ConvSequence(shape, out_channels)

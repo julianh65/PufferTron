@@ -525,7 +525,12 @@ class PuffeRL:
             num_agents = self.heuristic_eval_num_agents or eval_config['env_args'].get('num_agents', 2)
             eval_config['heuristic_eval_num_agents'] = max(2, num_agents)
             eval_config['heuristic_eval_num_envs'] = self.heuristic_eval_num_envs
+            eval_config['run_id'] = getattr(self.logger, 'run_id', 'offline')
+            eval_config['trainer_step'] = int(self.global_step)
             self._heuristic_evaluator = TronHeuristicEvaluator(eval_config)
+        else:
+            # Keep trainer step metadata in sync for downstream recordings
+            self._heuristic_evaluator._trainer_step = int(self.global_step)
 
         results = self._heuristic_evaluator.run(self.policy)
         self._heuristic_eval_next_step = self.global_step + self.heuristic_eval_interval

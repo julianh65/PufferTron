@@ -1177,6 +1177,11 @@ class TronProcgenResnet(pufferlib.models.ProcgenResnet):
                 dtype=np.float32,
             ),
         )
+        # Torch policies often receive generic sizing hints from config defaults.
+        # ProcgenResnet ignores these, so drop them before delegating to super().
+        kwargs.pop("hidden_size", None)
+        kwargs.pop("output_size", None)
+        kwargs.pop("input_size", None)
         super().__init__(fake_env, cnn_width=cnn_width, mlp_width=mlp_width, **kwargs)
         self._spatial_elems = self.vision * self.vision * 2
         self._channel_count = channel_count

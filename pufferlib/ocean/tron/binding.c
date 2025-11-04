@@ -98,6 +98,7 @@ static int my_log(PyObject* dict, Log* log) {
     assign_to_dict(dict, "score", log->score);
     assign_to_dict(dict, "episode_return", log->episode_return);
     assign_to_dict(dict, "episode_length", log->episode_length);
+    assign_to_dict(dict, "normalized_episode_length", log->normalized_episode_length);
     assign_to_dict(dict, "avg_survival_time", log->avg_survival_time);
     assign_to_dict(dict, "avg_alive_agents", log->avg_alive_agents);
     return 0;

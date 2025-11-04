@@ -1017,3 +1017,202 @@ class Drone(nn.Module):
 
         values = self.value(hidden)
         return logits, values
+
+
+def _tron_vision_from_env(env) -> int:
+    vision = getattr(env, "_vision", None)
+    if vision is not None:
+        return int(vision)
+
+    obs_shape = env.single_observation_space.shape
+    if len(obs_shape) != 1:
+        raise ValueError(
+            f"Expected flat observation space for Tron, got shape {obs_shape}"
+        )
+    flat = obs_shape[0]
+    if flat < 5 or (flat - 5) % 2 != 0:
+        raise ValueError(
+            f"Observation dimension {flat} does not match Tron layout (2*vision^2 + 5)."
+        )
+    vision_sq = (flat - 5) // 2
+    vision = int(np.sqrt(vision_sq))
+    if vision * vision != vision_sq:
+        raise ValueError(
+            "Tron observation size is not a perfect square; cannot infer vision."
+        )
+    return vision
+
+
+def _nature_cnn_flat_size(vision: int, downsample: int) -> int:
+    side = (vision + downsample - 1) // downsample
+    for kernel, stride in ((8, 4), (4, 2), (3, 1)):
+        side = (side - kernel) // stride + 1
+        if side <= 0:
+            raise ValueError(
+                f"vision_size {vision} (downsample {downsample}) is too small for the NatureCNN stack."
+            )
+    return side * side * 64
+
+
+def _split_tron_observation(observations: torch.Tensor, vision: int):
+    spatial_elems = vision * vision * 2
+    spatial = observations[:, :spatial_elems].reshape(-1, vision, vision, 2)
+    extras = observations[:, spatial_elems:]
+    return spatial, extras
+
+
+class TronConvolutional(pufferlib.models.Convolutional):
+    """Tron policy that adapts flat observations to the NatureCNN backbone."""
+
+    def __init__(
+        self,
+        env,
+        *,
+        include_trail: bool = True,
+        include_head: bool = True,
+        include_orientation: bool = True,
+        include_alive: bool = True,
+        downsample: int = 1,
+        **kwargs,
+    ):
+        self.vision = _tron_vision_from_env(env)
+        self.downsample = downsample
+        if not any((include_trail, include_head, include_orientation, include_alive)):
+            raise ValueError("At least one feature channel must be enabled for TronConvolutional.")
+
+        self.include_trail = include_trail
+        self.include_head = include_head
+        self.include_orientation = include_orientation
+        self.include_alive = include_alive
+
+        channel_count = 0
+        if include_trail:
+            channel_count += 1
+        if include_head:
+            channel_count += 1
+        if include_orientation:
+            channel_count += 4  # four orientation one-hot planes
+        if include_alive:
+            channel_count += 1
+
+        flat_size = _nature_cnn_flat_size(self.vision, downsample)
+        super().__init__(
+            env,
+            framestack=channel_count,
+            flat_size=flat_size,
+            downsample=downsample,
+            **kwargs,
+        )
+        self._spatial_elems = self.vision * self.vision * 2
+        self._channel_count = channel_count
+
+    def encode_observations(self, observations, state=None):
+        spatial, extras = _split_tron_observation(observations, self.vision)
+
+        channels = []
+        if self.include_trail or self.include_head:
+            trail = spatial[..., 0].unsqueeze(1)
+            head = spatial[..., 1].unsqueeze(1)
+            if self.include_trail:
+                channels.append(trail)
+            if self.include_head:
+                channels.append(head)
+
+        if self.include_orientation:
+            orient = extras[:, :4].reshape(-1, 4, 1, 1)
+            orient = orient.expand(-1, -1, self.vision, self.vision)
+            channels.append(orient)
+
+        if self.include_alive:
+            alive = extras[:, 4].reshape(-1, 1, 1, 1)
+            alive = alive.expand(-1, -1, self.vision, self.vision)
+            channels.append(alive)
+
+        stacked = torch.cat(channels, dim=1).float()
+        if self.downsample > 1:
+            stacked = stacked[:, :, :: self.downsample, :: self.downsample]
+        return self.network(stacked)
+
+
+class TronProcgenResnet(pufferlib.models.ProcgenResnet):
+    """Tron policy that feeds local vision into the Procgen ResNet backbone."""
+
+    def __init__(
+        self,
+        env,
+        *,
+        include_trail: bool = True,
+        include_head: bool = True,
+        include_orientation: bool = True,
+        include_alive: bool = True,
+        cnn_width: int = 16,
+        mlp_width: int = 256,
+        **kwargs,
+    ):
+        self.vision = _tron_vision_from_env(env)
+        if not any((include_trail, include_head, include_orientation, include_alive)):
+            raise ValueError("At least one feature channel must be enabled for TronProcgenResnet.")
+
+        self.include_trail = include_trail
+        self.include_head = include_head
+        self.include_orientation = include_orientation
+        self.include_alive = include_alive
+
+        channel_count = 0
+        if include_trail:
+            channel_count += 1
+        if include_head:
+            channel_count += 1
+        if include_orientation:
+            channel_count += 4
+        if include_alive:
+            channel_count += 1
+
+        fake_env = SimpleNamespace(
+            single_action_space=env.single_action_space,
+            single_observation_space=spaces.Box(
+                low=0.0,
+                high=1.0,
+                shape=(self.vision, self.vision, channel_count),
+                dtype=np.float32,
+            ),
+        )
+        super().__init__(fake_env, cnn_width=cnn_width, mlp_width=mlp_width, **kwargs)
+        self._spatial_elems = self.vision * self.vision * 2
+        self._channel_count = channel_count
+
+    def encode_observations(self, observations, state=None):
+        spatial, extras = _split_tron_observation(observations, self.vision)
+
+        channels = []
+        if self.include_trail or self.include_head:
+            if self.include_trail:
+                channels.append(spatial[..., 0:1])
+            if self.include_head:
+                channels.append(spatial[..., 1:2])
+
+        if self.include_orientation:
+            orient = extras[:, :4].reshape(-1, 1, 1, 4)
+            orient = orient.expand(-1, self.vision, self.vision, -1)
+            channels.append(orient)
+
+        if self.include_alive:
+            alive = extras[:, 4].reshape(-1, 1, 1, 1)
+            alive = alive.expand(-1, self.vision, self.vision, -1)
+            channels.append(alive)
+
+        stacked = torch.cat(channels, dim=3).float()
+        stacked = stacked.permute(0, 3, 1, 2)
+        return self.network(stacked)
+
+
+class TronRecurrent(pufferlib.models.LSTMWrapper):
+    """LSTM wrapper that auto-aligns with Tron CNN policy embedding size."""
+
+    def __init__(self, env, policy, input_size=None, hidden_size=None):
+        hidden = getattr(policy, "hidden_size", None)
+        if input_size is None:
+            input_size = hidden or getattr(policy, "output_size", None) or 128
+        if hidden_size is None:
+            hidden_size = hidden or input_size
+        super().__init__(env, policy, input_size=input_size, hidden_size=hidden_size)

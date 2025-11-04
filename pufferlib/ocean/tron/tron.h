@@ -33,6 +33,7 @@ typedef struct {
     float score;
     float episode_return;
     float episode_length;
+    float normalized_episode_length;
     float avg_survival_time;
     float avg_alive_agents;
     float n;
@@ -254,57 +255,37 @@ static void write_observations(Tron* env) {
 
         const int cx = env->pos_x[a];
         const int cy = env->pos_y[a];
+        const int dir = env->directions[a] & 3;
+
+        const int forward_x = DIR_X[dir];
+        const int forward_y = DIR_Y[dir];
+        const int right_x = -forward_y;
+        const int right_y = forward_x;
 
         float* TRON_RESTRICT out = obs;
 
-        const int y0 = cy - r_lo;
-        const int y1_exclusive = cy + r_hi + 1;
-
-        for (int wy = y0; wy < y1_exclusive; ++wy) {
-            if ((unsigned)wy < (unsigned)height) {
-                const int row = wy * width;
-
-                int x0 = cx - r_lo;
-                int x1_exclusive = cx + r_hi + 1;
-
-                int left_zeros = 0;
-                if (x0 < 0) {
-                    left_zeros = -x0;
-                    x0 = 0;
-                }
-
-                int right_zeros = 0;
-                if (x1_exclusive > width) {
-                    right_zeros = x1_exclusive - width;
-                    x1_exclusive = width;
-                }
-
-                for (int i = 0; i < left_zeros; ++i) {
+        for (int ly = -r_lo; ly <= r_hi; ++ly) {
+            const int f_scale = -ly;
+            const int base_x = cx + f_scale * forward_x;
+            const int base_y = cy + f_scale * forward_y;
+            for (int lx = -r_lo; lx <= r_hi; ++lx) {
+                const int wx = base_x + lx * right_x;
+                const int wy = base_y + lx * right_y;
+                if ((unsigned)wx >= (unsigned)width || (unsigned)wy >= (unsigned)height) {
                     *out++ = 1.0f;
                     *out++ = 0.0f;
+                    continue;
                 }
 
-                for (int x = x0; x < x1_exclusive; ++x) {
-                    const int cell = row + x;
-                    *out++ = (float)(trail[cell] != 0);
-                    *out++ = (float)(head[cell] != 0);
-                }
-
-                for (int i = 0; i < right_zeros; ++i) {
-                    *out++ = 1.0f;
-                    *out++ = 0.0f;
-                }
-            } else {
-                for (int i = 0; i < vision; ++i) {
-                    *out++ = 1.0f;
-                    *out++ = 0.0f;
-                }
+                const int cell = wy * width + wx;
+                *out++ = (float)(trail[cell] != 0);
+                *out++ = (float)(head[cell] != 0);
             }
         }
 
         float* TRON_RESTRICT orient = obs + window_elems;
         orient[0] = orient[1] = orient[2] = orient[3] = 0.0f;
-        orient[env->directions[a] & 3] = 1.0f;
+        orient[dir] = 1.0f;
         orient[4] = 1.0f;
     }
 }
@@ -343,6 +324,11 @@ static void accumulate_log(Tron* env, int survivors) {
     env->log.score += (float)env->steps_in_round;
     env->log.episode_return += total_reward / env->num_agents;
     env->log.episode_length += (float)env->steps_in_round;
+    float map_area = (float)env->width * (float)env->height;
+    if (map_area > 0.0f) {
+        float normalized_length = ((float)env->steps_in_round) * (float)env->num_agents / map_area;
+        env->log.normalized_episode_length += normalized_length;
+    }
     env->log.avg_survival_time += total_survival / env->num_agents;
     env->log.avg_alive_agents += survivors / (float)env->num_agents;
     env->log.n += 1.0f;

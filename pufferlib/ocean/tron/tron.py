@@ -89,7 +89,6 @@ class Tron(pufferlib.PufferEnv):
             dtype=np.uint8,
         )
         self._crash_color = np.array([245, 66, 86], dtype=np.uint8)
-        self._border_color = np.array([60, 60, 90], dtype=np.uint8)
         self._crash_marker_color = np.array([255, 230, 120], dtype=np.uint8)
         self.supports_rgb_render = True
 
@@ -173,10 +172,6 @@ class Tron(pufferlib.PufferEnv):
 
         frame = np.zeros((height, width, 3), dtype=np.uint8)
         frame[:] = self._background
-        frame[0, :] = self._border_color
-        frame[-1, :] = self._border_color
-        frame[:, 0] = self._border_color
-        frame[:, -1] = self._border_color
 
         palette_len = len(self._trail_palette)
         for agent_idx in range(self._agents_per_env):

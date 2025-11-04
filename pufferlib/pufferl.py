@@ -17,7 +17,7 @@ import argparse
 import importlib
 import configparser
 import copy
-from typing import Optional, Tuple
+from typing import Dict, Optional, Tuple
 from threading import Thread
 from collections import defaultdict, deque
 
@@ -244,7 +244,48 @@ class PuffeRL:
         self.heuristic_eval_video_fps = int(
             config.get('heuristic_eval_video_fps', self.video_fps) or self.video_fps or 12
         )
-        self.heuristic_eval_video_seed = config.get('heuristic_eval_video_seed', None)
+        raw_video_seed = config.get('heuristic_eval_video_seed', None)
+        self.heuristic_eval_video_seed = None
+        if isinstance(raw_video_seed, str):
+            raw_video_seed_stripped = raw_video_seed.strip()
+            if raw_video_seed_stripped:
+                try:
+                    self.heuristic_eval_video_seed = int(raw_video_seed_stripped)
+                except ValueError:
+                    warnings.warn(
+                        f"Ignoring invalid heuristic_eval_video_seed '{raw_video_seed}'",
+                        UserWarning,
+                    )
+        elif raw_video_seed is not None:
+            try:
+                self.heuristic_eval_video_seed = int(raw_video_seed)
+            except (TypeError, ValueError):
+                warnings.warn(
+                    f"Ignoring invalid heuristic_eval_video_seed '{raw_video_seed}'",
+                    UserWarning,
+                )
+        self._last_heuristic_video_seed = None
+        def _safe_float(value, default=0.0):
+            if isinstance(value, str) and value.strip().lower() == 'auto':
+                return default
+            try:
+                if value is None:
+                    return default
+                return float(value)
+            except (TypeError, ValueError):
+                return default
+
+        self.heuristic_eval_combo_win_weight = _safe_float(
+            config.get('heuristic_eval_combo_win_weight'), 0.0
+        )
+        self.heuristic_eval_combo_length_weight = _safe_float(
+            config.get('heuristic_eval_combo_length_weight'), 0.0
+        )
+        combo_base = config.get('heuristic_eval_combo_length_base', None)
+        combo_base_value = _safe_float(combo_base, None)
+        if combo_base in (0, '0'):
+            combo_base_value = None
+        self.heuristic_eval_combo_length_base = combo_base_value
 
         # Dashboard
         self.model_size = sum(p.numel() for p in policy.parameters() if p.requires_grad)
@@ -438,6 +479,38 @@ class PuffeRL:
         frames_array = np.stack(frames, axis=0)
         return self._write_video_file(frames_array)
 
+    def _compute_heuristic_combo_score(self, metrics: Dict[str, float]) -> Tuple[Optional[float], Optional[float]]:
+        win_weight = self.heuristic_eval_combo_win_weight
+        length_weight = self.heuristic_eval_combo_length_weight
+        total_weight = win_weight + length_weight
+        if total_weight <= 0:
+            return None, None
+
+        win_rate = float(metrics.get('win_rate', 0.0) or 0.0)
+        avg_length = float(metrics.get('avg_length', 0.0) or 0.0)
+
+        length_norm = self.heuristic_eval_combo_length_base
+        if (length_norm is None or length_norm <= 0) and self._heuristic_evaluator is not None:
+            env_max_steps = self._heuristic_evaluator.env_args.get('max_round_steps', 0)
+            try:
+                env_max_steps = float(env_max_steps)
+            except (TypeError, ValueError):
+                env_max_steps = 0.0
+            if env_max_steps > 0:
+                length_norm = env_max_steps
+
+        normalized_length = None
+        if length_norm is not None and length_norm > 0:
+            normalized_length = max(0.0, min(avg_length / length_norm, 1.0))
+
+        length_term = normalized_length if normalized_length is not None else 0.0
+        combo_score = (
+            win_weight * win_rate
+            + length_weight * length_term
+        ) / total_weight
+
+        return combo_score, normalized_length
+
     def _maybe_run_heuristic_eval(self):
         if not self._heuristic_eval_enabled:
             return {}
@@ -462,14 +535,29 @@ class PuffeRL:
             prefix = f'heuristic_eval/{name}'
             for key, value in metrics.items():
                 logs[f'{prefix}/{key}'] = value
+                if name == 'classic' and key == 'win_rate':
+                    logs['environment/heuristic_classic_win_rate'] = value
+                if name == 'classic' and key == 'avg_return':
+                    logs['environment/heuristic_classic_avg_return'] = value
+            combo_score, normalized_length = self._compute_heuristic_combo_score(metrics)
+            if normalized_length is not None:
+                logs[f'{prefix}/normalized_length'] = normalized_length
+            if combo_score is not None:
+                sanitized_name = name.replace('/', '_')
+                logs[f'{prefix}/combo_score'] = combo_score
+                logs[f'environment/heuristic_{sanitized_name}_combo_score'] = combo_score
 
         if self.heuristic_eval_video_opponent:
+            video_seed = self.heuristic_eval_video_seed
+            if video_seed is None:
+                video_seed = random.randint(0, 2**31 - 1)
+            self._last_heuristic_video_seed = video_seed
             try:
                 frames = self._heuristic_evaluator.generate_video(
                     self.policy,
                     self.heuristic_eval_video_opponent,
                     max_frames=max(1, self.heuristic_eval_video_length),
-                    seed=self.heuristic_eval_video_seed,
+                    seed=video_seed,
                 )
             except Exception as exc:
                 print(f"Heuristic video generation failed ({self.heuristic_eval_video_opponent}): {exc}")
@@ -497,9 +585,10 @@ class PuffeRL:
                                 except Exception as exc:
                                     print(f"Failed to log heuristic video to wandb: {exc}")
                                     logs[video_key] = video_path
-                            else:
-                                logs[video_key] = video_path
-                            self._video_id += 1
+                        else:
+                            logs[video_key] = video_path
+                        logs[f'{video_key}_seed'] = video_seed
+                        self._video_id += 1
 
         return logs
 

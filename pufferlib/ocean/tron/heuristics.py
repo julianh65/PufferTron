@@ -33,20 +33,40 @@ def _rotate_view(view: np.ndarray, orientation: int) -> np.ndarray:
     return np.rot90(view, k=-orientation)
 
 
+def _as_bool(value) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return False
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return False
+
+
 @dataclass
 class HeuristicResult:
     wins: int = 0
     draws: int = 0
     losses: int = 0
     return_total: float = 0.0
+    steps_total: int = 0
+    steps_sq_total: float = 0.0
 
     def totals(self) -> Dict[str, float]:
         total_games = max(self.wins + self.draws + self.losses, 1)
+        avg_return = self.return_total / total_games
+        avg_steps = self.steps_total / total_games
+        # Population variance estimate for episode length
+        mean_sq_diff = max(self.steps_sq_total / total_games - avg_steps ** 2, 0.0)
         return {
             "win_rate": self.wins / total_games,
             "draw_rate": self.draws / total_games,
             "loss_rate": self.losses / total_games,
-            "avg_return": self.return_total / total_games,
+            "avg_return": avg_return,
+            "avg_length": avg_steps,
+            "length_std": mean_sq_diff ** 0.5,
         }
 
 
@@ -186,17 +206,27 @@ class ClassicTronBotHeuristic(TronHeuristic):
 
     MOVE_TO_DIR = {1: 0, 2: 1, 3: 2, 4: 3}
 
-    def __init__(self, vision: int, bot_path: str, env_index: int = 0, per_move_timeout: float = 0.1):
+    def __init__(
+        self,
+        vision: int,
+        bot_path: str,
+        env_index: int = 0,
+        per_move_timeout: float = 0.1,
+        debug: bool = False,
+    ):
         super().__init__(vision)
         self.bot_path = os.path.abspath(bot_path)
         self.env_index = env_index
         self.per_move_timeout = max(0.0, float(per_move_timeout))
+        self.debug = debug
         self.process: Optional[subprocess.Popen] = None
         self._opponent_indices: List[int] = []
         self._policy_indices: List[int] = []
         self._agents_per_env: int = 0
         self._timeout_misses = 0
         self._warning_emitted = False
+        self._episode_counter = 0
+        self._step_in_episode = 0
 
     def __del__(self):
         self._terminate_process()
@@ -210,6 +240,8 @@ class ClassicTronBotHeuristic(TronHeuristic):
         self._agents_per_env = getattr(env, "_agents_per_env", env.num_agents)
         self._timeout_misses = 0
         self._warning_emitted = False
+        self._episode_counter += 1
+        self._step_in_episode = 0
         self._start_process()
 
     def _start_process(self) -> None:
@@ -218,19 +250,30 @@ class ClassicTronBotHeuristic(TronHeuristic):
             raise FileNotFoundError(f"Classic Tron bot not found at '{self.bot_path}'")
 
         cwd = os.path.dirname(self.bot_path) or None
+        env = os.environ.copy()
+        if self.debug:
+            env["TRONBOT_DEBUG"] = env.get("TRONBOT_DEBUG", "1")
+        else:
+            env.pop("TRONBOT_DEBUG", None)
         try:
             self.process = subprocess.Popen(
                 [self.bot_path],
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL,
+                stderr=None if self.debug else subprocess.DEVNULL,
                 text=True,
                 cwd=cwd,
                 bufsize=1,
+                env=env,
             )
         except Exception as exc:
             raise RuntimeError(f"Failed to launch Classic Tron bot from '{self.bot_path}': {exc}") from exc
         self._timeout_misses = 0
+        if self.debug:
+            print(
+                f"[TronBot] Started process '{self.bot_path}' "
+                f"(episode {self._episode_counter})"
+            )
 
     def end_episode(self) -> None:
         self._terminate_process()
@@ -238,8 +281,16 @@ class ClassicTronBotHeuristic(TronHeuristic):
     def act_with_env(self, env: Tron, observation: np.ndarray, agent_index: int) -> int:
         if self.process is None or self.process.stdin is None or self.process.stdout is None:
             raise RuntimeError("Classic Tron bot process is not running. Did begin_episode fail?")
+        if self.process.poll() is not None:
+            if self.debug:
+                print(
+                    f"[TronBot] Process exited with code {self.process.returncode} "
+                    f"(episode {self._episode_counter}, step {self._step_in_episode})"
+                )
+            self._start_process()
 
         board_payload = self._build_board_payload(env)
+        send_start = time.perf_counter()
         try:
             self.process.stdin.write(board_payload)
             self.process.stdin.flush()
@@ -250,7 +301,17 @@ class ClassicTronBotHeuristic(TronHeuristic):
             try:
                 self._start_process()
             except Exception:
+                if self.debug:
+                    print(
+                        f"[TronBot] Broken pipe fallback (episode {self._episode_counter}, step {self._step_in_episode})"
+                    )
+                self._step_in_episode += 1
                 return ACTION_FORWARD
+            if self.debug:
+                print(
+                    f"[TronBot] Broken pipe restart success (episode {self._episode_counter}, step {self._step_in_episode})"
+                )
+            self._step_in_episode += 1
             return ACTION_FORWARD
 
         move_line = self._readline_with_timeout(self.per_move_timeout)
@@ -259,6 +320,12 @@ class ClassicTronBotHeuristic(TronHeuristic):
             if not self._warning_emitted:
                 print("Warning: Classic Tron bot timed out; defaulting to forward action.")
                 self._warning_emitted = True
+            if self.debug:
+                print(
+                    f"[TronBot] Timeout "
+                    f"(episode {self._episode_counter}, step {self._step_in_episode})"
+                )
+            self._step_in_episode += 1
             return ACTION_FORWARD
 
         move_line = move_line.strip()
@@ -269,9 +336,27 @@ class ClassicTronBotHeuristic(TronHeuristic):
             if not self._warning_emitted:
                 print(f"Warning: Classic Tron bot returned '{move_line}' – defaulting to forward action.")
                 self._warning_emitted = True
+            if self.debug:
+                print(
+                    f"[TronBot] Non-integer move '{move_line}' "
+                    f"(episode {self._episode_counter}, step {self._step_in_episode})"
+                )
+            self._step_in_episode += 1
             return ACTION_FORWARD
 
-        return self._convert_move_to_action(tron_move, observation)
+        elapsed_ms = (time.perf_counter() - send_start) * 1000.0
+        action = self._convert_move_to_action(tron_move, observation)
+        if self.debug:
+            state = binding.env_get(env._c_env_handles[self.env_index])
+            width = int(state["width"])
+            height = int(state["height"])
+            print(
+                f"[TronBot] Episode {self._episode_counter} step {self._step_in_episode}: "
+                f"move {tron_move} -> action {action} in {elapsed_ms:.2f} ms "
+                f"(map {width}x{height})"
+            )
+        self._step_in_episode += 1
+        return action
 
     def _convert_move_to_action(self, tron_move: int, observation: np.ndarray) -> int:
         current_dir = _parse_orientation(observation[-5:])
@@ -299,18 +384,19 @@ class ClassicTronBotHeuristic(TronHeuristic):
         head_owner = np.frombuffer(state["head_owner"], dtype=np.uint8).reshape(height, width)
         alive = np.frombuffer(state["alive"], dtype=np.uint8)
 
-        grid = np.full((height, width), " ", dtype="<U1")
-        grid[trail_owner > 0] = "#"
-        grid[0, :] = "#"
-        grid[-1, :] = "#"
-        grid[:, 0] = "#"
-        grid[:, -1] = "#"
+        padded_width = width + 2
+        padded_height = height + 2
+        grid_chars: List[List[str]] = [["#" for _ in range(padded_width)] for _ in range(padded_height)]
+
+        for y in range(height):
+            for x in range(width):
+                grid_chars[y + 1][x + 1] = "#" if trail_owner[y, x] > 0 else " "
 
         bot_agent_id = self._map_agent_index_to_local(self._opponent_indices[0])
         bot_position = self._find_head_position(head_owner, bot_agent_id)
         if bot_position and alive[bot_agent_id - 1]:
-            y, x = bot_position
-            grid[y, x] = "1"
+            by, bx = bot_position
+            grid_chars[by + 1][bx + 1] = "1"
 
         for idx in self._policy_indices:
             opp_agent_id = self._map_agent_index_to_local(idx)
@@ -318,11 +404,16 @@ class ClassicTronBotHeuristic(TronHeuristic):
                 continue
             pos = self._find_head_position(head_owner, opp_agent_id)
             if pos and alive[opp_agent_id - 1]:
-                y, x = pos
-                grid[y, x] = "2"
+                oy, ox = pos
+                grid_chars[oy + 1][ox + 1] = "2"
 
-        lines = ["".join(row.tolist()) for row in grid]
-        return f"{width} {height}\n" + "\n".join(lines) + "\n"
+        lines = ["".join(row) for row in grid_chars]
+        if self.debug and lines:
+            print(
+                f"[TronBot] Payload row length {len(lines[0])} (expected {padded_width}) "
+                f"example row: {repr(lines[0][:min(10, len(lines[0]))])}"
+            )
+        return f"{padded_width} {padded_height}\n" + "\n".join(lines) + "\n"
 
     def _map_agent_index_to_local(self, agent_index: int) -> int:
         if self._agents_per_env <= 0:
@@ -365,6 +456,11 @@ class ClassicTronBotHeuristic(TronHeuristic):
         except subprocess.TimeoutExpired:
             self.process.kill()
         finally:
+            if self.debug and self.process is not None:
+                print(
+                    f"[TronBot] Process terminated (return code {self.process.returncode}) "
+                    f"(episode {self._episode_counter}, step {self._step_in_episode})"
+                )
             self.process = None
 
 
@@ -424,10 +520,15 @@ class TronHeuristicEvaluator:
                 or env_args.get("heuristic_eval_tronbot_timeout")
             )
             per_move_timeout = float(timeout_cfg) if timeout_cfg not in (None, "") else 0.1
+            debug_cfg = config.get("heuristic_eval_tronbot_debug")
+            if debug_cfg is None:
+                debug_cfg = env_args.get("heuristic_eval_tronbot_debug")
+            debug_flag = _as_bool(debug_cfg)
             self.heuristics["classic"] = ClassicTronBotHeuristic(
                 vision,
                 tronbot_path,
                 per_move_timeout=per_move_timeout,
+                debug=debug_flag,
             )
             if self.num_agents > 2:
                 self.num_agents = 2
@@ -553,6 +654,7 @@ class TronHeuristicEvaluator:
                 opponent.reset()
                 obs, _ = env.reset(seed=self.base_seed + episode)
                 episode_returns = np.zeros(self.num_agents, dtype=np.float32)
+                episode_steps = 0
 
                 lstm_state = None
                 if self.use_rnn and hidden_size is not None:
@@ -582,6 +684,7 @@ class TronHeuristicEvaluator:
 
                         obs, rewards, terminals, truncations, _ = env.step(joint_actions)
                         episode_returns += rewards
+                        episode_steps += 1
 
                         if self.use_rnn and lstm_state is not None:
                             done = torch.as_tensor(terminals[policy_indices], device=self.device, dtype=torch.bool)
@@ -596,6 +699,8 @@ class TronHeuristicEvaluator:
                             policy_return = float(episode_returns[policy_indices].mean())
                             opponent_return = float(episode_returns[opponent_indices].mean())
                             result.return_total += policy_return
+                            result.steps_total += episode_steps
+                            result.steps_sq_total += episode_steps ** 2
 
                             if policy_return > opponent_return + 1e-6:
                                 result.wins += 1
